@@ -1,0 +1,151 @@
+"""Strategy v1: walk-forward momentum on five crypto pairs (retired; see README).
+
+At each rebalance, for every coin it picks the lookback window with the best trailing
+Sharpe ratio, goes long if that window's return is positive, sizes positions by inverse
+volatility, and applies a 15% trailing stop. Run this file to backtest it from 2022 and
+print the performance report against BTC and an equal-weight basket.
+"""
+import numpy as np
+import pandas as pd
+from twsq.alpha import Alpha
+
+from performance_report import evaluate
+
+
+class WFO_Dynamic_Mom(Alpha):
+
+    def prepare(self, tickers, test_windows, capital, rebalance_days=30, stop_loss_pct=0.15):
+        self.tickers = tickers
+        self.test_windows = test_windows
+        self.capital = capital
+        self.rebalance_days = rebalance_days
+        self.days_since_rebalance = rebalance_days  # forces a rebalance on the first bar
+        self.stop_loss_pct = stop_loss_pct
+        self.high_water_marks = {}
+
+    def rebalance(self):
+        # 1. Daily Crash Protection (Trailing Stop-Loss)
+        current_positions = self.get_pos()
+        stopped_today = set()
+
+        for ticker in self.tickers:
+            base_asset = ticker.split('/')[0]
+            qty = current_positions.get(base_asset, 0)
+
+            if qty > 0:
+                current_price = self.get_current_price(ticker)
+                peak_price = self.high_water_marks.get(ticker, current_price)
+
+                # A peak of 0.0 means the last position was stopped out; start a fresh peak.
+                if peak_price <= 0:
+                    peak_price = current_price
+
+                # Store the peak every day (not only on new highs), so a position that
+                # falls steadily from entry is still measured against its entry price.
+                if current_price > peak_price:
+                    peak_price = current_price
+                self.high_water_marks[ticker] = peak_price
+
+                if current_price <= peak_price * (1 - self.stop_loss_pct):
+                    self.create_order(ticker, qty, 'sell', route=True)
+                    self.high_water_marks[ticker] = 0.0
+                    stopped_today.add(ticker)
+
+        # 2. Rebalance Throttle (rebalances every `rebalance_days` bars)
+        self.days_since_rebalance += 1
+        if self.days_since_rebalance < self.rebalance_days:
+            return
+
+        self.days_since_rebalance = 0
+        target_positions = {}
+        inv_vols = {}
+        signals = {}
+        warmup = max(self.test_windows)
+
+        # 3. Optimization and Signal Generation
+        for ticker in self.tickers:
+            if ticker in stopped_today:
+                continue
+
+            bars = self.get_lastn_bars(ticker, 365, '1d')
+            if bars is None or len(bars) < warmup + 30:
+                target_positions[ticker.split('/')[0]] = 0.0
+                continue
+
+            prices = bars['close']
+            daily_returns = prices.pct_change(1).fillna(0)
+
+            best_sharpe = -np.inf
+            best_window = 30
+
+            for w in self.test_windows:
+                ret_window = prices.pct_change(periods=w)
+                sig_array = np.where(ret_window > 0, 1, 0)
+                sig_series = pd.Series(sig_array, index=prices.index).shift(1).fillna(0)
+
+                # Score every window over the same period, after the longest window's
+                # warm-up, so short windows are not credited with extra days of data.
+                strat_ret = (sig_series * daily_returns).iloc[warmup + 1:]
+
+                if len(strat_ret) > 1:
+                    ann_ret = strat_ret.mean() * 365
+                    ann_vol = strat_ret.std() * np.sqrt(365)
+                    sharpe = ann_ret / ann_vol if ann_vol != 0 else 0
+
+                    if sharpe > best_sharpe:
+                        best_sharpe = sharpe
+                        best_window = w
+
+            current_ret = (prices.iloc[-1] - prices.iloc[-(best_window + 1)]) / prices.iloc[-(best_window + 1)]
+            signals[ticker] = 1 if current_ret > 0 else 0
+
+            recent_vol = daily_returns.tail(30).std()
+            inv_vols[ticker] = 1.0 / recent_vol if recent_vol > 0 else 0.0
+
+        # 4. Capital Allocation and Route Order
+        total_inv_vol = sum(inv_vols[t] for t in signals if signals[t] > 0)
+
+        for ticker in self.tickers:
+            # An asset stopped out today is left alone: its sell order is already
+            # routed, and it is not bought straight back on the same bar.
+            if ticker in stopped_today:
+                continue
+
+            base_asset = ticker.split('/')[0]
+
+            if signals.get(ticker, 0) > 0 and total_inv_vol > 0:
+                weight = inv_vols[ticker] / total_inv_vol
+                dollar_allocation = self.capital * weight
+                current_price = self.get_current_price(ticker)
+
+                target_positions[base_asset] = dollar_allocation / current_price
+            else:
+                target_positions[base_asset] = 0.0
+
+        self.trade_to_target(target_positions, route=True)
+
+
+if __name__ == "__main__":
+    tickers_list = ['BTC/USD', 'ETH/USD', 'SOL/USD', 'XRP/USD', 'ADA/USD']
+    test_windows_list = [7, 14, 21, 30, 60, 90]
+    initial_capital = 100000
+
+    print("Executing TWSQ Backtest...")
+
+    result = WFO_Dynamic_Mom.run_backtest(
+        start_ts='20220101',
+        freq='1d',
+        name='WFO_Dynamic_Mom_Backtest',
+        tickers=tickers_list,
+        test_windows=test_windows_list,
+        capital=initial_capital,
+        stop_loss_pct=0.15,
+        taker_fee=26e-4,
+        maker_fee=16e-4,
+        slip=10e-4
+    )
+
+    print("Backtest complete. Results stored in MyTWSQ/alphas/WFO_Dynamic_Mom_Backtest/backtest")
+    print("Fetching benchmark data for evaluation...")
+
+    evaluate(result.pos_pnl, initial_capital, tickers_list)
