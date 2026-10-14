@@ -26,6 +26,9 @@ class WFO_Dynamic_Mom(Alpha):
             if qty > 0:
                 current_price = self.get_current_price(ticker)
                 peak_price = self.high_water_marks.get(ticker, current_price)
+
+                if peak_price <= 0:
+                    peak_price = current_price
                 
                 if current_price > peak_price:
                     self.high_water_marks[ticker] = current_price
